@@ -15,7 +15,7 @@
 
 - 📝 I regularly write articles on [https://dhruvadeep.dev](https://dhruvadeep.dev)
 
-- 📫 How to reach me **dhruvadeepmalakar12345@gmail.com**
+- 📫 How to reach me **contact@dhruvadeep.dev**
 
 - 📄 Know about my experiences [https://dhruvadeep.dev/resume](https://dhruvadeep.dev/resume)
 
