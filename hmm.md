@@ -1,3 +1,603 @@
+I'll modify the client to check for the `is_safe` boolean parameter in each tool and display a warning if it's missing.
+
+## Updated MCP Client (with is_safe parameter check)
+
+```python
+"""MCP Streamable HTTP Client - Tool Discovery with Safety Check"""
+
+import argparse
+import asyncio
+from contextlib import AsyncExitStack
+from typing import Optional
+import json
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv() 
+
+HTTP_PROXY = os.getenv("HTTP_PROXY", "http://webproxy.ext.ti.com:80")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY", "http://webproxy.ext.ti.com:80")
+NO_PROXY = os.getenv("NO_PROXY", "localhost,127.0.0.1,.ti.com")
+
+os.environ["HTTP_PROXY"] = HTTP_PROXY
+os.environ["HTTPS_PROXY"] = HTTPS_PROXY
+os.environ["NO_PROXY"] = NO_PROXY
+
+class MCPToolLister:
+    """MCP Client for discovering and listing tools from an MCP server with safety checks"""
+
+    def __init__(self):
+        self.session: Optional[ClientSession] = None
+        self.exit_stack = AsyncExitStack()
+
+    async def connect_to_streamable_http_server(
+        self, server_url: str, headers: Optional[dict] = None
+    ):
+        """Connect to an MCP server running with HTTP Streamable transport"""
+        self._streams_context = streamablehttp_client(
+            url=server_url,
+            headers=headers or {},
+        )
+        read_stream, write_stream, _ = await self._streams_context.__aenter__()
+
+        self._session_context = ClientSession(read_stream, write_stream)
+        self.session: ClientSession = await self._session_context.__aenter__()
+
+        # Initialize the connection
+        await self.session.initialize()
+        print("✅ Connected to MCP Streamable HTTP server successfully.")
+
+    def _check_is_safe_parameter(self, tool_schema: dict) -> tuple[bool, str]:
+        """
+        Check if the tool has an 'is_safe' boolean parameter
+        
+        Returns:
+            tuple: (has_is_safe_param, status_message)
+        """
+        if not tool_schema or 'properties' not in tool_schema:
+            return False, "❌ No input schema properties found"
+        
+        properties = tool_schema['properties']
+        
+        if 'is_safe' not in properties:
+            return False, "❌ Missing 'is_safe' parameter"
+        
+        is_safe_param = properties['is_safe']
+        param_type = is_safe_param.get('type', '')
+        
+        if param_type != 'boolean':
+            return False, f"❌ 'is_safe' parameter is not boolean (found: {param_type})"
+        
+        return True, "✅ Has 'is_safe' boolean parameter"
+
+    async def list_tools(self):
+        """List all available tools from the MCP server with safety parameter check"""
+        if not self.session:
+            print("❌ No active session. Connect to server first.")
+            return
+
+        try:
+            # Get the list of tools
+            result = await self.session.list_tools()
+            tools = result.tools
+
+            if not tools:
+                print("📭 No tools available on this server.")
+                return
+
+            print(f"\n🔧 Found {len(tools)} tools on the server:\n")
+            print("=" * 80)
+
+            # Count tools with/without is_safe parameter
+            tools_with_safe_param = 0
+            tools_without_safe_param = 0
+
+            for i, tool in enumerate(tools, 1):
+                print(f"\n[{i}] Tool: {tool.name}")
+                print(f"    Description: {tool.description or 'No description provided'}")
+                
+                # Check for is_safe parameter
+                has_safe_param, safe_status = self._check_is_safe_parameter(
+                    tool.inputSchema if hasattr(tool, 'inputSchema') else {}
+                )
+                
+                if has_safe_param:
+                    tools_with_safe_param += 1
+                    print(f"    Safety Check: {safe_status}")
+                else:
+                    tools_without_safe_param += 1
+                    print(f"    Safety Check: ❌ {safe_status}")
+                    print(f"    ⚠️  WARNING: This tool doesn't have a safety parameter!")
+                
+                # Display input schema
+                if hasattr(tool, 'inputSchema') and tool.inputSchema:
+                    schema = tool.inputSchema
+                    print(f"    Input Schema:")
+                    print(f"      Type: {schema.get('type', 'Not specified')}")
+                    
+                    if 'properties' in schema:
+                        print(f"      Parameters:")
+                        for param_name, param_info in schema['properties'].items():
+                            param_type = param_info.get('type', 'unknown')
+                            param_desc = param_info.get('description', 'No description')
+                            required = param_name in schema.get('required', [])
+                            required_text = " (required)" if required else " (optional)"
+                            
+                            # Highlight the is_safe parameter if present
+                            if param_name == 'is_safe':
+                                print(f"        - {param_name}: {param_type}{required_text} 🔒")
+                            else:
+                                print(f"        - {param_name}: {param_type}{required_text}")
+                            
+                            if param_desc != 'No description':
+                                print(f"          Description: {param_desc}")
+
+                # Display annotations if available
+                if hasattr(tool, 'annotations') and tool.annotations:
+                    print(f"    Annotations:")
+                    annotations = tool.annotations
+                    if hasattr(annotations, 'title') and annotations.title:
+                        print(f"      Title: {annotations.title}")
+                    if hasattr(annotations, 'readOnlyHint'):
+                        print(f"      Read Only: {annotations.readOnlyHint}")
+                    if hasattr(annotations, 'destructiveHint'):
+                        print(f"      Destructive: {annotations.destructiveHint}")
+                    if hasattr(annotations, 'idempotentHint'):
+                        print(f"      Idempotent: {annotations.idempotentHint}")
+                    if hasattr(annotations, 'openWorldHint'):
+                        print(f"      Open World: {annotations.openWorldHint}")
+
+                print("-" * 40)
+
+            # Summary
+            print(f"\n📊 Safety Parameter Summary:")
+            print(f"    ✅ Tools with 'is_safe' parameter: {tools_with_safe_param}")
+            print(f"    ❌ Tools without 'is_safe' parameter: {tools_without_safe_param}")
+            
+            if tools_without_safe_param > 0:
+                print(f"\n⚠️  WARNING: {tools_without_safe_param} tool(s) lack safety parameters!")
+                print("    Consider adding 'is_safe: boolean' parameter to these tools for better safety control.")
+
+        except Exception as e:
+            print(f"❌ Failed to list tools: {e}")
+
+    async def list_resources(self):
+        """List all available resources from the MCP server"""
+        if not self.session:
+            print("❌ No active session. Connect to server first.")
+            return
+
+        try:
+            # Get the list of resources
+            result = await self.session.list_resources()
+            resources = result.resources
+
+            if not resources:
+                print("📭 No resources available on this server.")
+                return
+
+            print(f"\n📚 Found {len(resources)} resources on the server:\n")
+            print("=" * 80)
+
+            for i, resource in enumerate(resources, 1):
+                print(f"\n[{i}] Resource: {resource.uri}")
+                print(f"    Name: {resource.name or 'No name provided'}")
+                print(f"    Description: {resource.description or 'No description provided'}")
+                print(f"    MIME Type: {resource.mimeType or 'Not specified'}")
+                print("-" * 40)
+
+        except Exception as e:
+            print(f"❌ Failed to list resources: {e}")
+
+    async def get_server_info(self):
+        """Get server information"""
+        if not self.session:
+            print("❌ No active session. Connect to server first.")
+            return
+
+        try:
+            # Server info is available after initialization
+            print(f"\n🖥️  Server Information:")
+            print(f"    Name: {self.session.server_name}")
+            print(f"    Version: {self.session.server_version}")
+            print(f"    Protocol Version: {self.session.protocol_version}")
+            
+            # Check capabilities
+            capabilities = self.session.server_capabilities
+            print(f"    Capabilities:")
+            if hasattr(capabilities, 'tools') and capabilities.tools:
+                print(f"      ✅ Tools supported")
+            if hasattr(capabilities, 'resources') and capabilities.resources:
+                print(f"      ✅ Resources supported")
+            if hasattr(capabilities, 'logging') and capabilities.logging:
+                print(f"      ✅ Logging supported")
+            if hasattr(capabilities, 'prompts') and capabilities.prompts:
+                print(f"      ✅ Prompts supported")
+
+        except Exception as e:
+            print(f"❌ Failed to get server info: {e}")
+
+    async def cleanup(self):
+        """Properly clean up the session and streams"""
+        try:
+            if hasattr(self, '_session_context') and self._session_context:
+                await self._session_context.__aexit__(None, None, None)
+            if hasattr(self, '_streams_context') and self._streams_context:
+                await self._streams_context.__aexit__(None, None, None)
+            print("🧹 Client cleanup completed.")
+        except Exception as e:
+            print(f"❌ Error during cleanup: {e}")
+
+
+async def main():
+    """Main function to run the MCP tool discovery client"""
+    parser = argparse.ArgumentParser(description="Discover and list MCP tools with safety checks")
+    parser.add_argument(
+        "--mcp-localhost-port", 
+        type=int, 
+        default=8002, 
+        help="Localhost port to connect to"
+    )
+    parser.add_argument(
+        "--show-resources", 
+        action="store_true", 
+        help="Also show available resources"
+    )
+    parser.add_argument(
+        "--show-server-info", 
+        action="store_true", 
+        help="Show server information"
+    )
+    parser.add_argument(
+        "--safety-check-only", 
+        action="store_true", 
+        help="Only show safety parameter check results"
+    )
+    
+    args = parser.parse_args()
+
+    client = MCPToolLister()
+    try:
+        # Connect to the server
+        server_url = f"http://localhost:{args.mcp_localhost_port}/mcp"
+        print(f"🔗 Connecting to MCP server at: {server_url}")
+        
+        await client.connect_to_streamable_http_server(server_url)
+        
+        # Show server info if requested
+        if args.show_server_info:
+            await client.get_server_info()
+        
+        # List all tools with safety checks
+        await client.list_tools()
+        
+        # List resources if requested
+        if args.show_resources:
+            await client.list_resources()
+            
+    except Exception as e:
+        print(f"❌ Failed to connect or list tools: {e}")
+        print(f"   Make sure your MCP server is running on port {args.mcp_localhost_port}")
+    finally:
+        await client.cleanup()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+## Updated Server (with is_safe parameter for some tools)
+
+Here's an updated server where some tools have the `is_safe` parameter and some don't, so you can test the safety check:
+
+```python
+"""
+Enhanced Arithmetic MCP Server - With Safety Parameter Testing
+============================================================
+
+This version includes some tools with 'is_safe' parameter and some without
+to demonstrate the safety parameter checking functionality.
+"""
+
+from mcp.server.fastmcp import FastMCP
+import os
+from dotenv import load_dotenv
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv() 
+
+HTTP_PROXY = os.getenv("HTTP_PROXY", "http://webproxy.ext.ti.com:80")
+HTTPS_PROXY = os.getenv("HTTPS_PROXY", "http://webproxy.ext.ti.com:80")
+NO_PROXY = os.getenv("NO_PROXY", "localhost,127.0.0.1,.ti.com")
+
+os.environ["HTTP_PROXY"] = HTTP_PROXY
+os.environ["HTTPS_PROXY"] = HTTPS_PROXY
+os.environ["NO_PROXY"] = NO_PROXY
+
+# Create an MCP server
+mcp = FastMCP(
+    name="Safety-Test Arithmetic Server",
+    version="1.0.0",
+    port=8002,
+    host="127.0.0.1"
+)
+
+# Tools WITH is_safe parameter
+@mcp.tool(
+    annotations={
+        "title": "Safe Add Numbers",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+def add(a: float, b: float, is_safe: bool = True) -> float:
+    """
+    Add two numbers together with safety check.
+    
+    Args:
+        a: First number to add
+        b: Second number to add
+        is_safe: Safety flag to ensure secure operation
+    """
+    if not is_safe:
+        raise ValueError("Operation not allowed without safety confirmation")
+    
+    result = a + b
+    logger.info(f"Safe Addition: {a} + {b} = {result}")
+    return result
+
+@mcp.tool(
+    annotations={
+        "title": "Safe Multiply Numbers", 
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+def multiply(a: float, b: float, is_safe: bool = True) -> float:
+    """
+    Multiply two numbers with safety check.
+    
+    Args:
+        a: First number to multiply
+        b: Second number to multiply
+        is_safe: Safety flag to ensure secure operation
+    """
+    if not is_safe:
+        raise ValueError("Operation not allowed without safety confirmation")
+    
+    result = a * b
+    logger.info(f"Safe Multiplication: {a} × {b} = {result}")
+    return result
+
+# Tools WITHOUT is_safe parameter (for testing)
+@mcp.tool(
+    annotations={
+        "title": "Unsafe Subtract Numbers",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+def subtract(a: float, b: float) -> float:
+    """
+    Subtract two numbers (without safety parameter).
+    
+    Args:
+        a: Number to subtract from
+        b: Number to subtract
+    """
+    result = a - b
+    logger.info(f"Unsafe Subtraction: {a} - {b} = {result}")
+    return result
+
+@mcp.tool(
+    annotations={
+        "title": "Unsafe Divide Numbers",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+def divide(a: float, b: float) -> float:
+    """
+    Divide two numbers (without safety parameter).
+    
+    Args:
+        a: Number to divide
+        b: Number to divide by
+    """
+    if b == 0:
+        raise ValueError("Cannot divide by zero")
+    
+    result = a / b
+    logger.info(f"Unsafe Division: {a} ÷ {b} = {result}")
+    return result
+
+@mcp.tool(
+    annotations={
+        "title": "Safe Power Operation",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+def power(base: float, exponent: float, is_safe: bool = True) -> float:
+    """
+    Calculate power with safety check.
+    
+    Args:
+        base: Base number
+        exponent: Exponent
+        is_safe: Safety flag to ensure secure operation
+    """
+    if not is_safe:
+        raise ValueError("Operation not allowed without safety confirmation")
+    
+    result = base ** exponent
+    logger.info(f"Safe Power: {base}^{exponent} = {result}")
+    return result
+
+@mcp.resource("help://arithmetic")
+def arithmetic_help() -> str:
+    """Get help on using the Safety-Test Arithmetic Server."""
+    return """
+Safety-Test Arithmetic Server Help
+==================================
+
+This server demonstrates MCP tools with and without safety parameters.
+
+🔒 Tools WITH is_safe parameter:
+- add(a, b, is_safe=True) - Safe addition
+- multiply(a, b, is_safe=True) - Safe multiplication  
+- power(base, exponent, is_safe=True) - Safe power operation
+
+❌ Tools WITHOUT is_safe parameter:
+- subtract(a, b) - Unsafe subtraction
+- divide(a, b) - Unsafe division
+
+The client will detect which tools have the safety parameter and warn about those that don't.
+    """
+
+if __name__ == "__main__":
+    print("🚀 Starting Safety-Test Arithmetic MCP Server...")
+    print("   This server has mixed tools - some with 'is_safe' parameter, some without")
+    print("   Use the client to see safety parameter detection in action")
+    
+    try:
+        mcp.run("streamable-http")
+    except KeyboardInterrupt:
+        print("\n🛑 Server shutdown requested")
+    except Exception as e:
+        logger.error(f"Server error: {e}")
+        print(f"❌ Server error: {e}")
+```
+
+## Expected Output
+
+When you run the client against this server, you'll see output like:
+
+```
+🔗 Connecting to MCP server at: http://localhost:8002/mcp
+✅ Connected to MCP Streamable HTTP server successfully.
+
+🔧 Found 5 tools on the server:
+
+================================================================================
+
+[1] Tool: add
+    Description: Add two numbers together with safety check.
+    Safety Check: ✅ Has 'is_safe' boolean parameter
+    Input Schema:
+      Type: object
+      Parameters:
+        - a: number (required)
+        - b: number (required)
+        - is_safe: boolean (optional) 🔒
+----------------------------------------
+
+[2] Tool: multiply
+    Description: Multiply two numbers with safety check.
+    Safety Check: ✅ Has 'is_safe' boolean parameter
+    Input Schema:
+      Type: object
+      Parameters:
+        - a: number (required)
+        - b: number (required)
+        - is_safe: boolean (optional) 🔒
+----------------------------------------
+
+[3] Tool: subtract
+    Description: Subtract two numbers (without safety parameter).
+    Safety Check: ❌ Missing 'is_safe' parameter
+    ⚠️  WARNING: This tool doesn't have a safety parameter!
+    Input Schema:
+      Type: object
+      Parameters:
+        - a: number (required)
+        - b: number (required)
+----------------------------------------
+
+[4] Tool: divide
+    Description: Divide two numbers (without safety parameter).
+    Safety Check: ❌ Missing 'is_safe' parameter
+    ⚠️  WARNING: This tool doesn't have a safety parameter!
+    Input Schema:
+      Type: object
+      Parameters:
+        - a: number (required)
+        - b: number (required)
+----------------------------------------
+
+[5] Tool: power
+    Description: Calculate power with safety check.
+    Safety Check: ✅ Has 'is_safe' boolean parameter
+    Input Schema:
+      Type: object
+      Parameters:
+        - base: number (required)
+        - exponent: number (required)
+        - is_safe: boolean (optional) 🔒
+----------------------------------------
+
+📊 Safety Parameter Summary:
+    ✅ Tools with 'is_safe' parameter: 3
+    ❌ Tools without 'is_safe' parameter: 2
+
+⚠️  WARNING: 2 tool(s) lack safety parameters!
+    Consider adding 'is_safe: boolean' parameter to these tools for better safety control.
+
+🧹 Client cleanup completed.
+```
+
+The client now:
+- ✅ Checks each tool for the `is_safe` boolean parameter
+- ✅ Shows ❌ cross emoji for tools missing the safety parameter
+- ✅ Displays warning messages for unsafe tools
+- ✅ Highlights the `is_safe` parameter with a 🔒 emoji when present
+- ✅ Provides a summary count of safe vs unsafe tools
+- ✅ Shows overall warning if any tools lack safety parameters
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 I'll help you create a proper MCP client that lists all available tools from your server, and also improve your server implementation.
 
 ## Updated MCP Client (Tool Lister)
